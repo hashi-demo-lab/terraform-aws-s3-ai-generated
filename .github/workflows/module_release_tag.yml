@@ -1,0 +1,242 @@
+# Tag-Based Module Release Workflow
+# Automatically publishes to Terraform Private Module Registry when a new tag is created
+#
+# USE CASE: Tag-based PMR sources
+# - Auto-detects new semantic version tags (v1.0.0, v1.1.0, etc.)
+# - Automatically publishes to PMR
+# - PMR CANNOT run tests (tests run in this workflow before release)
+#
+# HOW IT WORKS:
+# 1. Create a release/tag in GitHub (e.g., v1.0.0)
+# 2. This workflow triggers automatically
+# 3. Runs integration tests to validate the release
+# 4. Creates a GitHub Release with changelog
+# 5. PMR auto-detects the new tag and publishes
+#
+# REQUIRED SECRETS:
+# - TFE_TOKEN: Terraform Cloud/Enterprise API token
+# - AWS_ACCESS_KEY_ID: For integration tests (optional)
+# - AWS_SECRET_ACCESS_KEY: For integration tests (optional)
+#
+# REQUIRED VARIABLES:
+# - TFE_ORG: Terraform Cloud organization name
+# - TFE_MODULE: Module name (without provider suffix)
+# - TFE_PROVIDER: Provider name (aws, azurerm, google, etc.)
+
+name: 'Module Release (Tag-Based)'
+
+run-name: 'Release: ${{ github.ref_name }}'
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'  # Pre-release tags like v1.0.0-beta.1
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip integration tests'
+        required: false
+        default: 'false'
+        type: boolean
+      dry_run:
+        description: 'Dry run (no actual release)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  TERRAFORM_VERSION: '1.9.0'
+
+jobs:
+  validate-tag:
+    name: 'Validate Tag'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+
+    steps:
+      - name: Extract Version from Tag
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Remove 'v' prefix if present
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Check if pre-release
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "## Version Information" >> $GITHUB_STEP_SUMMARY
+          echo "- Tag: $TAG" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "- Pre-release: ${{ steps.version.outputs.is_prerelease || 'false' }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Validate Semantic Version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Regex for semantic versioning (with optional pre-release)
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?$ ]]; then
+            echo "❌ Invalid semantic version: $VERSION"
+            exit 1
+          fi
+          echo "✅ Valid semantic version: $VERSION"
+
+  integration-tests:
+    name: 'Integration Tests'
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    if: ${{ inputs.skip_tests != 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TFE_TOKEN }}
+
+      - name: Configure AWS Credentials
+        if: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Run Integration Tests
+        id: integration_tests
+        run: |
+          echo "## Integration Tests" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "tests/integration-tests.tftest.hcl" ]; then
+            echo "Running integration tests..."
+            if terraform test -filter=tests/integration-tests.tftest.hcl; then
+              echo "✅ All integration tests passed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Integration tests failed" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          else
+            echo "ℹ️ No integration tests found - skipping" >> $GITHUB_STEP_SUMMARY
+          fi
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+
+  create-release:
+    name: 'Create GitHub Release'
+    needs: [validate-tag, integration-tests]
+    if: always() && (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          # Get the previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          CURRENT_TAG="${{ github.ref_name }}"
+
+          echo "## Changelog" > changelog.md
+          echo "" >> changelog.md
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            echo "### Changes since $PREVIOUS_TAG" >> changelog.md
+            echo "" >> changelog.md
+            git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD >> changelog.md
+          else
+            echo "### Initial Release" >> changelog.md
+            echo "" >> changelog.md
+            git log --pretty=format:"- %s (%h)" >> changelog.md
+          fi
+
+          echo "" >> changelog.md
+          echo "" >> changelog.md
+          echo "---" >> changelog.md
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREVIOUS_TAG...$CURRENT_TAG" >> changelog.md
+
+          cat changelog.md
+
+      - name: Create Release
+        if: ${{ inputs.dry_run != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ needs.validate-tag.outputs.version }}
+          body_path: changelog.md
+          prerelease: ${{ needs.validate-tag.outputs.is_prerelease == 'true' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dry Run Summary
+        if: ${{ inputs.dry_run == 'true' }}
+        run: |
+          echo "## 🧪 Dry Run Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Would have created release:" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ needs.validate-tag.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Pre-release: ${{ needs.validate-tag.outputs.is_prerelease }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Release Summary
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          echo "## 🎉 Release Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ needs.validate-tag.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-release | ${{ needs.validate-tag.outputs.is_prerelease }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### PMR Auto-Publish" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Tag-based PMR sources will automatically detect and publish this version." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note**: Tag-based PMR cannot run integration tests within the registry." >> $GITHUB_STEP_SUMMARY
+          echo "Tests were executed in this workflow before release." >> $GITHUB_STEP_SUMMARY
+
+  notify-pmr:
+    name: 'Notify PMR Status'
+    needs: [validate-tag, create-release]
+    if: always() && needs.create-release.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check PMR Configuration
+        run: |
+          echo "## Private Module Registry" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -n "${{ vars.TFE_ORG }}" ] && [ -n "${{ vars.TFE_MODULE }}" ]; then
+            echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+            echo "- Organization: ${{ vars.TFE_ORG }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Module: ${{ vars.TFE_MODULE }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Provider: ${{ vars.TFE_PROVIDER || 'aws' }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Expected Module Source" >> $GITHUB_STEP_SUMMARY
+            echo '```hcl' >> $GITHUB_STEP_SUMMARY
+            echo 'module "example" {' >> $GITHUB_STEP_SUMMARY
+            echo '  source  = "app.terraform.io/${{ vars.TFE_ORG }}/${{ vars.TFE_MODULE }}/${{ vars.TFE_PROVIDER || 'aws' }}"' >> $GITHUB_STEP_SUMMARY
+            echo '  version = "${{ needs.validate-tag.outputs.version }}"' >> $GITHUB_STEP_SUMMARY
+            echo '}' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ PMR not configured. Set TFE_ORG, TFE_MODULE, and TFE_PROVIDER repository variables." >> $GITHUB_STEP_SUMMARY
+          fi

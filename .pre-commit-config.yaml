@@ -1,0 +1,104 @@
+# Pre-commit hooks for Terraform module development
+#
+# Install: pre-commit install
+# Run manually: pre-commit run --all-files
+# Update hooks: pre-commit autoupdate
+#
+# This configuration enforces code quality before commits reach the repository.
+# CI/CD workflows provide additional validation for PRs and releases.
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+        name: Check for large files
+      - id: end-of-file-fixer
+        name: Fix end of files
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+      - id: check-yaml
+        name: Check YAML syntax
+      - id: check-json
+        name: Check JSON syntax
+      - id: detect-private-key
+        name: Detect private keys
+
+  # Terraform formatting and validation
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.103.0
+    hooks:
+      # Format Terraform files
+      - id: terraform_fmt
+        name: Terraform Format
+        description: Rewrites Terraform files to canonical format
+
+      # Validate Terraform configuration
+      - id: terraform_validate
+        name: Terraform Validate
+        description: Validates Terraform configuration files
+        args:
+          - --hook-config=--retry-once-with-cleanup=true
+
+      # Lint with tflint
+      - id: terraform_tflint
+        name: Terraform Lint
+        description: Lints Terraform files with tflint
+        args:
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
+
+      # Security scanning with trivy
+      - id: terraform_trivy
+        name: Terraform Security (Trivy)
+        description: Scans for security misconfigurations
+        args:
+          - --args=--severity=CRITICAL,HIGH
+          - --args=--skip-dirs=.terraform
+          - --args=--tf-exclude-downloaded-modules
+
+      # Generate documentation
+      - id: terraform_docs
+        name: Terraform Docs
+        description: Updates README.md with terraform-docs
+        args:
+          - --hook-config=--path-to-file=README.md
+          - --hook-config=--add-to-existing-file=true
+          - --hook-config=--create-file-if-not-exist=true
+
+  # Local hooks for unit tests
+  - repo: local
+    hooks:
+      # Run unit tests (plan-only, no infrastructure)
+      - id: terraform-unit-tests
+        name: Terraform Unit Tests
+        description: Runs unit tests (plan-only validation)
+        entry: bash -c 'if [ -f "tests/unit-tests.tftest.hcl" ]; then terraform test -filter=tests/unit-tests.tftest.hcl; else echo "No unit tests found"; fi'
+        language: system
+        pass_filenames: false
+        files: '\.(tf|tfvars|tftest\.hcl)$'
+        stages: [pre-push]  # Run on push, not commit (faster commits)
+
+      # Check for required semantic version label reminder
+      - id: semver-reminder
+        name: Semver Label Reminder
+        description: Reminds to add semver label on PRs
+        entry: bash -c 'echo "Remember to add semver:patch, semver:minor, or semver:major label to your PR"'
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        always_run: true
+
+  # Vault Radar security scanning (optional)
+  - repo: local
+    hooks:
+      - id: vault-radar-scan
+        name: Vault Radar Scan
+        description: Scans for secrets with HashiCorp Vault Radar
+        entry: bash -c 'if command -v vault-radar &> /dev/null && [ -n "$VAULT_RADAR_LICENSE" ]; then vault-radar scan git pre-commit "$@" || exit $?; else echo "Vault Radar scan skipped (not installed or licensed)"; fi'
+        language: system
+        pass_filenames: false
+        always_run: true

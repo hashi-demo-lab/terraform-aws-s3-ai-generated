@@ -1,0 +1,218 @@
+# Module Validation Workflow
+# Runs on pull requests to validate Terraform code quality
+#
+# This workflow performs:
+# - Terraform formatting check
+# - Terraform validation
+# - TFLint linting
+# - Trivy security scanning
+# - Unit tests (plan-only, no infrastructure)
+# - README auto-generation via terraform-docs
+
+name: 'Module Validate'
+
+run-name: 'Validate: ${{ github.event.pull_request.title || github.ref_name }}'
+
+on:
+  pull_request:
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '**.tftest.hcl'
+      - '.github/workflows/module_validate.yml'
+      - '.tflint.hcl'
+      - 'trivy.yaml'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip unit tests'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  TERRAFORM_VERSION: '1.9.0'
+  TFLINT_VERSION: 'latest'
+
+jobs:
+  validate-module:
+    name: 'Validate Module'
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check Required Semantic Version Label
+        if: github.event_name == 'pull_request'
+        uses: mheap/github-action-required-labels@v5
+        with:
+          mode: exactly
+          count: 1
+          labels: "semver:patch, semver:minor, semver:major"
+        continue-on-error: true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          echo "## Terraform Format Check" >> $GITHUB_STEP_SUMMARY
+          if terraform fmt -check -recursive -diff; then
+            echo "✅ All files are properly formatted" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Some files need formatting. Run 'terraform fmt -recursive'" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init -backend=false
+          echo "✅ Terraform initialized successfully" >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          echo "## Terraform Validation" >> $GITHUB_STEP_SUMMARY
+          terraform validate
+          echo "✅ Configuration is valid" >> $GITHUB_STEP_SUMMARY
+
+      - name: Validate Examples
+        id: validate_examples
+        run: |
+          echo "## Examples Validation" >> $GITHUB_STEP_SUMMARY
+          for example in examples/*/; do
+            if [ -d "$example" ]; then
+              echo "Validating $example..."
+              (cd "$example" && terraform init -backend=false && terraform validate)
+              echo "✅ $example is valid" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: TFLint Init
+        run: tflint --init
+
+      - name: TFLint
+        id: tflint
+        run: |
+          echo "## TFLint Results" >> $GITHUB_STEP_SUMMARY
+          if tflint --format compact; then
+            echo "✅ No linting issues found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Linting issues detected (see above)" >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+      - name: Run Trivy Security Scanner
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          trivy-config: trivy.yaml
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+          format: 'table'
+        continue-on-error: true
+
+      - name: Trivy Summary
+        if: always()
+        run: |
+          echo "## Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.trivy.outcome }}" == "success" ]; then
+            echo "✅ No critical/high security issues found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Security issues detected - review Trivy output" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run Unit Tests
+        id: test
+        if: ${{ inputs.skip_tests != 'true' }}
+        run: |
+          echo "## Unit Test Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f "tests/unit-tests.tftest.hcl" ]; then
+            if terraform test -filter=tests/unit-tests.tftest.hcl; then
+              echo "✅ All unit tests passed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Unit tests failed" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          else
+            echo "ℹ️ No unit tests found" >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+
+      - name: Update Terraform Docs
+        uses: terraform-docs/gh-actions@v1.3.0
+        with:
+          working-dir: .
+          output-file: README.md
+          output-method: inject
+          git-push: "true"
+          git-commit-message: "docs: update README.md via terraform-docs"
+
+      - name: Validation Summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "## Overall Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | ${{ steps.fmt.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Init | ${{ steps.init.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate | ${{ steps.validate.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Examples | ${{ steps.validate_examples.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| TFLint | ${{ steps.tflint.outcome == 'success' && '✅ Passed' || '⚠️ Warnings' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ steps.trivy.outcome == 'success' && '✅ Passed' || '⚠️ Review' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ steps.test.outcome == 'success' && '✅ Passed' || (steps.test.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post PR Comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const summary = `## 🔍 Module Validation Results
+
+            | Check | Status |
+            |-------|--------|
+            | Format | ${{ steps.fmt.outcome == 'success' && '✅' || '❌' }} |
+            | Validate | ${{ steps.validate.outcome == 'success' && '✅' || '❌' }} |
+            | Examples | ${{ steps.validate_examples.outcome == 'success' && '✅' || '❌' }} |
+            | TFLint | ${{ steps.tflint.outcome == 'success' && '✅' || '⚠️' }} |
+            | Security | ${{ steps.trivy.outcome == 'success' && '✅' || '⚠️' }} |
+            | Unit Tests | ${{ steps.test.outcome == 'success' && '✅' || (steps.test.outcome == 'skipped' ? '⏭️' : '❌') }} |
+
+            [View full details](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });

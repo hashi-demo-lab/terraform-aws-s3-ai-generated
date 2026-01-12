@@ -1,0 +1,108 @@
+# .terraform-docs.yml - terraform-docs configuration for README auto-generation
+
+formatter: markdown table
+
+version: ">= 0.18.0"
+
+header-from: docs/header.md
+footer-from: docs/footer.md
+
+recursive:
+  enabled: false
+
+sections:
+  hide: []
+  show: []
+
+content: |-
+  {{ .Header }}
+
+  ## Usage
+
+  ### Basic Usage - Secure Bucket (Default)
+
+  ```hcl
+  module "s3_bucket" {
+    source  = "app.terraform.io/hashi-demos-apj/s3/aws"
+    version = "~> 1.0"
+
+    bucket_name      = "my-secure-bucket-12345"
+    application_name = "my-application"
+    environment      = "dev"
+  }
+  ```
+
+  ### KMS Encryption
+
+  ```hcl
+  module "s3_bucket" {
+    source  = "app.terraform.io/hashi-demos-apj/s3/aws"
+    version = "~> 1.0"
+
+    bucket_name             = "my-kms-encrypted-bucket"
+    application_name        = "my-application"
+    environment             = "prod"
+    encryption_type         = "KMS"
+    enable_kms_key_rotation = true
+  }
+  ```
+
+  ### Static Website Hosting
+
+  ```hcl
+  module "website_bucket" {
+    source  = "app.terraform.io/hashi-demos-apj/s3/aws"
+    version = "~> 1.0"
+
+    bucket_name            = "my-website-bucket"
+    application_name       = "my-website"
+    environment            = "prod"
+    enable_website         = true
+    website_index_document = "index.html"
+    website_error_document = "error.html"
+  }
+  ```
+
+  {{ .Requirements }}
+
+  {{ .Providers }}
+
+  {{ .Modules }}
+
+  {{ .Resources }}
+
+  {{ .Inputs }}
+
+  {{ .Outputs }}
+
+  {{ .Footer }}
+
+output:
+  file: README.md
+  mode: replace
+  template: |-
+    <!-- BEGIN_TF_DOCS -->
+    {{ .Content }}
+    <!-- END_TF_DOCS -->
+
+output-values:
+  enabled: false
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: true
+  color: true
+  default: true
+  description: true
+  escape: true
+  hide-empty: false
+  html: true
+  indent: 2
+  lockfile: true
+  read-comments: true
+  required: true
+  sensitive: true
+  type: true

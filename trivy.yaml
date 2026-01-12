@@ -1,0 +1,41 @@
+# trivy.yaml - Trivy security scanning configuration for Terraform
+
+# Scan Configuration
+scan:
+  # Target directories
+  scanners:
+    - misconfig
+
+  # Skip specific files/directories
+  skip-dirs:
+    - .terraform
+    - .git
+    - examples
+    - tests
+
+# Severity Configuration
+severity:
+  - CRITICAL
+  - HIGH
+
+# Misconfiguration Settings
+misconfiguration:
+  # Enable Terraform scanning
+  terraform:
+    enabled: true
+
+  # Include non-failures in output
+  include-non-failures: false
+
+# Exit code configuration
+exit-code: 1
+
+# Output format
+format: table
+
+# Ignore unfixed vulnerabilities
+ignore-unfixed: false
+
+# Cache configuration
+cache:
+  backend: fs

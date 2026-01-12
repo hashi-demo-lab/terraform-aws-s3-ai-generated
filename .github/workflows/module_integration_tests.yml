@@ -1,0 +1,215 @@
+# Integration Tests Workflow
+# Runs integration tests that deploy real infrastructure
+#
+# USE CASES:
+# 1. Manual trigger for testing before release
+# 2. Scheduled runs for regression testing
+# 3. Called by PMR after branch-based publication
+#
+# IMPORTANT: This deploys real AWS resources!
+# - Resources are created and destroyed automatically
+# - Ensure proper AWS credentials are configured
+# - Review cost implications before enabling scheduled runs
+#
+# REQUIRED SECRETS:
+# - TFE_TOKEN: Terraform Cloud/Enterprise API token
+# - AWS_ACCESS_KEY_ID: AWS credentials for test deployment
+# - AWS_SECRET_ACCESS_KEY: AWS credentials for test deployment
+#
+# OPTIONAL VARIABLES:
+# - AWS_REGION: AWS region for test deployment (default: us-east-1)
+
+name: 'Integration Tests'
+
+run-name: 'Integration Tests: ${{ github.ref_name }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: 'Test file filter (leave empty for all)'
+        required: false
+        default: ''
+        type: string
+      destroy_on_failure:
+        description: 'Destroy resources on test failure'
+        required: false
+        default: 'true'
+        type: boolean
+  schedule:
+    # Run weekly on Sundays at 2am UTC (optional - can be disabled)
+    - cron: '0 2 * * 0'
+  workflow_call:
+    inputs:
+      test_filter:
+        description: 'Test file filter'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      TFE_TOKEN:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TERRAFORM_VERSION: '1.9.0'
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  setup-fixtures:
+    name: 'Setup Test Fixtures'
+    runs-on: ubuntu-latest
+    outputs:
+      fixtures_created: ${{ steps.setup.outputs.created }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Test Fixtures
+        id: setup
+        working-directory: tests/setup
+        run: |
+          if [ -f "main.tf" ]; then
+            echo "Setting up test fixtures..."
+            terraform init
+            terraform apply -auto-approve
+            echo "created=true" >> $GITHUB_OUTPUT
+            echo "✅ Test fixtures created" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No test fixtures found"
+            echo "created=false" >> $GITHUB_OUTPUT
+          fi
+
+  integration-tests:
+    name: 'Run Integration Tests'
+    needs: setup-fixtures
+    runs-on: ubuntu-latest
+    outputs:
+      test_result: ${{ steps.test.outputs.result }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Initialize Module
+        run: terraform init
+
+      - name: Run Integration Tests
+        id: test
+        run: |
+          echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          TEST_FILTER="${{ inputs.test_filter || '' }}"
+
+          if [ -n "$TEST_FILTER" ]; then
+            echo "Running filtered tests: $TEST_FILTER"
+            FILTER_ARG="-filter=$TEST_FILTER"
+          else
+            FILTER_ARG="-filter=tests/integration-tests.tftest.hcl"
+          fi
+
+          if terraform test $FILTER_ARG -verbose; then
+            echo "result=success" >> $GITHUB_OUTPUT
+            echo "✅ All integration tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "result=failure" >> $GITHUB_OUTPUT
+            echo "❌ Integration tests failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+
+  cleanup-fixtures:
+    name: 'Cleanup Test Fixtures'
+    needs: [setup-fixtures, integration-tests]
+    if: always() && needs.setup-fixtures.outputs.fixtures_created == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Destroy Test Fixtures
+        working-directory: tests/setup
+        run: |
+          # Check if we should destroy on failure
+          if [ "${{ needs.integration-tests.outputs.test_result }}" == "failure" ] && [ "${{ inputs.destroy_on_failure }}" == "false" ]; then
+            echo "⚠️ Skipping cleanup due to test failure (destroy_on_failure=false)"
+            echo "⚠️ Resources left for debugging. Remember to clean up manually!" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "Destroying test fixtures..."
+          terraform init
+          terraform destroy -auto-approve
+          echo "✅ Test fixtures destroyed" >> $GITHUB_STEP_SUMMARY
+
+  test-summary:
+    name: 'Test Summary'
+    needs: [integration-tests, cleanup-fixtures]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 📊 Integration Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | ${{ needs.integration-tests.outputs.test_result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cleanup | ${{ needs.cleanup-fixtures.result == 'success' && '✅ Complete' || '⚠️ Check' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.integration-tests.outputs.test_result }}" == "success" ]; then
+            echo "All integration tests passed successfully! ✅" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Integration tests failed. Review the logs for details. ❌" >> $GITHUB_STEP_SUMMARY
+          fi

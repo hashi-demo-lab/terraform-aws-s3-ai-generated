@@ -1,0 +1,270 @@
+# Breaking Changes Detection Workflow
+# Analyzes PRs for potential breaking changes in Terraform modules
+#
+# DETECTS:
+# - Removed or renamed variables
+# - Changed variable types
+# - Removed or renamed outputs
+# - Changed output types
+# - Provider version constraint changes
+# - Terraform version constraint changes
+#
+# This helps ensure semver:major is used when breaking changes are detected
+
+name: 'Breaking Changes Detection'
+
+run-name: 'Breaking Changes: ${{ github.event.pull_request.title }}'
+
+on:
+  pull_request:
+    paths:
+      - 'variables.tf'
+      - 'outputs.tf'
+      - 'versions.tf'
+      - 'terraform.tf'
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect-breaking-changes:
+    name: 'Detect Breaking Changes'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR Branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Base Branch Files
+        run: |
+          mkdir -p /tmp/base
+          git show origin/${{ github.base_ref }}:variables.tf > /tmp/base/variables.tf 2>/dev/null || touch /tmp/base/variables.tf
+          git show origin/${{ github.base_ref }}:outputs.tf > /tmp/base/outputs.tf 2>/dev/null || touch /tmp/base/outputs.tf
+          git show origin/${{ github.base_ref }}:versions.tf > /tmp/base/versions.tf 2>/dev/null || touch /tmp/base/versions.tf
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install python-hcl2
+
+      - name: Analyze Breaking Changes
+        id: analyze
+        run: |
+          cat > analyze_breaking_changes.py << 'EOF'
+          import hcl2
+          import json
+          import sys
+          import os
+
+          def parse_tf_file(filepath):
+              """Parse a Terraform file and return its content."""
+              try:
+                  with open(filepath, 'r') as f:
+                      return hcl2.load(f)
+              except Exception as e:
+                  return {}
+
+          def get_variables(tf_content):
+              """Extract variable definitions."""
+              variables = {}
+              for var in tf_content.get('variable', []):
+                  for name, config in var.items():
+                      variables[name] = {
+                          'type': config.get('type', 'any'),
+                          'default': 'default' in config,
+                          'description': config.get('description', '')
+                      }
+              return variables
+
+          def get_outputs(tf_content):
+              """Extract output definitions."""
+              outputs = {}
+              for out in tf_content.get('output', []):
+                  for name, config in out.items():
+                      outputs[name] = {
+                          'description': config.get('description', ''),
+                          'sensitive': config.get('sensitive', False)
+                      }
+              return outputs
+
+          def compare_variables(base_vars, pr_vars):
+              """Compare variables and detect breaking changes."""
+              breaking = []
+              warnings = []
+
+              for name, config in base_vars.items():
+                  if name not in pr_vars:
+                      breaking.append(f"🔴 REMOVED variable: `{name}`")
+                  elif pr_vars[name]['type'] != config['type']:
+                      breaking.append(f"🔴 CHANGED type of variable `{name}`: `{config['type']}` → `{pr_vars[name]['type']}`")
+                  elif config['default'] and not pr_vars[name]['default']:
+                      breaking.append(f"🔴 REMOVED default value from variable: `{name}` (now required)")
+
+              for name in pr_vars:
+                  if name not in base_vars:
+                      if not pr_vars[name]['default']:
+                          breaking.append(f"🔴 NEW required variable: `{name}` (no default)")
+                      else:
+                          warnings.append(f"🟡 NEW optional variable: `{name}`")
+
+              return breaking, warnings
+
+          def compare_outputs(base_outs, pr_outs):
+              """Compare outputs and detect breaking changes."""
+              breaking = []
+              warnings = []
+
+              for name in base_outs:
+                  if name not in pr_outs:
+                      breaking.append(f"🔴 REMOVED output: `{name}`")
+
+              for name in pr_outs:
+                  if name not in base_outs:
+                      warnings.append(f"🟡 NEW output: `{name}`")
+
+              return breaking, warnings
+
+          def main():
+              base_dir = '/tmp/base'
+              pr_dir = '.'
+
+              all_breaking = []
+              all_warnings = []
+
+              # Compare variables
+              base_vars = get_variables(parse_tf_file(f'{base_dir}/variables.tf'))
+              pr_vars = get_variables(parse_tf_file(f'{pr_dir}/variables.tf'))
+              breaking, warnings = compare_variables(base_vars, pr_vars)
+              all_breaking.extend(breaking)
+              all_warnings.extend(warnings)
+
+              # Compare outputs
+              base_outs = get_outputs(parse_tf_file(f'{base_dir}/outputs.tf'))
+              pr_outs = get_outputs(parse_tf_file(f'{pr_dir}/outputs.tf'))
+              breaking, warnings = compare_outputs(base_outs, pr_outs)
+              all_breaking.extend(breaking)
+              all_warnings.extend(warnings)
+
+              # Output results
+              result = {
+                  'breaking': all_breaking,
+                  'warnings': all_warnings,
+                  'has_breaking': len(all_breaking) > 0
+              }
+
+              print(json.dumps(result))
+              return 0 if not all_breaking else 1
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          EOF
+
+          RESULT=$(python analyze_breaking_changes.py)
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
+
+          # Parse and output
+          HAS_BREAKING=$(echo "$RESULT" | jq -r '.has_breaking')
+          echo "has_breaking=$HAS_BREAKING" >> $GITHUB_OUTPUT
+
+      - name: Generate Report
+        id: report
+        run: |
+          RESULT='${{ steps.analyze.outputs.result }}'
+
+          echo "## 🔍 Breaking Changes Analysis" > report.md
+          echo "" >> report.md
+
+          BREAKING=$(echo "$RESULT" | jq -r '.breaking[]' 2>/dev/null || echo "")
+          WARNINGS=$(echo "$RESULT" | jq -r '.warnings[]' 2>/dev/null || echo "")
+
+          if [ -n "$BREAKING" ]; then
+            echo "### ⚠️ Breaking Changes Detected" >> report.md
+            echo "" >> report.md
+            echo "The following breaking changes require a **semver:major** version bump:" >> report.md
+            echo "" >> report.md
+            echo "$BREAKING" | while read line; do
+              echo "- $line" >> report.md
+            done
+            echo "" >> report.md
+            echo "---" >> report.md
+            echo "" >> report.md
+            echo "**Action Required**: Add the \`semver:major\` label to this PR." >> report.md
+          else
+            echo "### ✅ No Breaking Changes" >> report.md
+            echo "" >> report.md
+            echo "No breaking changes detected in this PR." >> report.md
+          fi
+
+          if [ -n "$WARNINGS" ]; then
+            echo "" >> report.md
+            echo "### ℹ️ Non-Breaking Changes" >> report.md
+            echo "" >> report.md
+            echo "$WARNINGS" | while read line; do
+              echo "- $line" >> report.md
+            done
+          fi
+
+          cat report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('report.md', 'utf8');
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.login === 'github-actions[bot]' &&
+              comment.body.includes('Breaking Changes Analysis')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: report
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report
+              });
+            }
+
+      - name: Check for semver:major Label
+        if: steps.analyze.outputs.has_breaking == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const hasBreakingLabel = labels.some(label =>
+              label.name === 'semver:major' || label.name === 'breaking-change'
+            );
+
+            if (!hasBreakingLabel) {
+              core.warning('Breaking changes detected but semver:major label is missing');
+              // Optionally fail the check
+              // core.setFailed('Add semver:major label for breaking changes');
+            }

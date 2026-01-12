@@ -1,0 +1,333 @@
+# Branch-Based Module Release Workflow
+# Publishes to Terraform Private Module Registry from branch merges
+#
+# USE CASE: Branch-based PMR sources
+# - Triggered when PRs merge to main
+# - Calculates next semantic version from PR labels
+# - Manually publishes to PMR with specific commit SHA
+# - PMR CAN run tests after publication
+#
+# KEY DIFFERENCES FROM TAG-BASED:
+# - Must manually publish version to PMR (even after merge to main)
+# - Must specify commit SHA when publishing
+# - PMR can run integration tests after publication
+# - Version calculated from semver:* labels on PR
+#
+# HOW IT WORKS:
+# 1. PR is created with semver:patch, semver:minor, or semver:major label
+# 2. PR is merged to main
+# 3. This workflow calculates the next version
+# 4. Publishes to PMR via API with commit SHA
+# 5. PMR runs configured tests (if enabled)
+#
+# REQUIRED SECRETS:
+# - TFE_TOKEN: Terraform Cloud/Enterprise API token
+#
+# REQUIRED VARIABLES:
+# - TFE_ORG: Terraform Cloud organization name
+# - TFE_MODULE: Module name (without provider suffix)
+# - TFE_PROVIDER: Provider name (aws, azurerm, google, etc.)
+
+name: 'Module Release (Branch-Based)'
+
+run-name: 'Release: ${{ github.event.pull_request.title || github.ref_name }}'
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version increment type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: 'Dry run (calculate version but do not publish)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  TFE_HOSTNAME: ${{ vars.TFE_HOSTNAME || 'app.terraform.io' }}
+
+jobs:
+  check-merge:
+    name: 'Check Merge Status'
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version_type: ${{ steps.check.outputs.version_type }}
+
+    steps:
+      - name: Determine Version Type
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            echo "version_type=${{ inputs.version_type }}" >> $GITHUB_OUTPUT
+            echo "Manual trigger with version type: ${{ inputs.version_type }}"
+          else
+            # Check PR labels for semver type
+            LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+            echo "PR Labels: $LABELS"
+
+            if echo "$LABELS" | grep -q "semver:major"; then
+              echo "version_type=major" >> $GITHUB_OUTPUT
+              echo "should_release=true" >> $GITHUB_OUTPUT
+            elif echo "$LABELS" | grep -q "semver:minor"; then
+              echo "version_type=minor" >> $GITHUB_OUTPUT
+              echo "should_release=true" >> $GITHUB_OUTPUT
+            elif echo "$LABELS" | grep -q "semver:patch"; then
+              echo "version_type=patch" >> $GITHUB_OUTPUT
+              echo "should_release=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_release=false" >> $GITHUB_OUTPUT
+              echo "⚠️ No semver label found. Skipping release."
+              echo "Add one of: semver:patch, semver:minor, semver:major"
+            fi
+          fi
+
+  calculate-version:
+    name: 'Calculate Version'
+    needs: check-merge
+    if: needs.check-merge.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      current_version: ${{ steps.version.outputs.current_version }}
+      new_version: ${{ steps.version.outputs.new_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Current Version from PMR
+        id: pmr_version
+        run: |
+          # Try to get current version from PMR
+          if [ -n "${{ vars.TFE_ORG }}" ] && [ -n "${{ vars.TFE_MODULE }}" ] && [ -n "${{ secrets.TFE_TOKEN }}" ]; then
+            PROVIDER="${{ vars.TFE_PROVIDER || 'aws' }}"
+            API_URL="https://${{ env.TFE_HOSTNAME }}/api/v2/organizations/${{ vars.TFE_ORG }}/registry-modules/private/${{ vars.TFE_ORG }}/${{ vars.TFE_MODULE }}/$PROVIDER"
+
+            echo "Querying PMR: $API_URL"
+
+            RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.TFE_TOKEN }}" \
+              -H "Content-Type: application/vnd.api+json" \
+              "$API_URL" 2>/dev/null || echo '{"data":null}')
+
+            if echo "$RESPONSE" | jq -e '.data.attributes."version-statuses"' > /dev/null 2>&1; then
+              # Get the latest published version
+              CURRENT=$(echo "$RESPONSE" | jq -r '.data.attributes."version-statuses" | to_entries | map(select(.value == "ok")) | sort_by(.key | split(".") | map(tonumber)) | last | .key // "0.0.0"')
+              echo "current_version=$CURRENT" >> $GITHUB_OUTPUT
+              echo "Found current version in PMR: $CURRENT"
+            else
+              echo "current_version=0.0.0" >> $GITHUB_OUTPUT
+              echo "No existing version found in PMR (new module)"
+            fi
+          else
+            # Fall back to git tags
+            CURRENT=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0")
+            echo "current_version=$CURRENT" >> $GITHUB_OUTPUT
+            echo "Using git tag version: $CURRENT"
+          fi
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+
+      - name: Calculate New Version
+        id: version
+        run: |
+          CURRENT="${{ steps.pmr_version.outputs.current_version }}"
+          VERSION_TYPE="${{ needs.check-merge.outputs.version_type }}"
+
+          echo "Current version: $CURRENT"
+          echo "Version type: $VERSION_TYPE"
+          echo "current_version=$CURRENT" >> $GITHUB_OUTPUT
+
+          # Parse version components
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+
+          # Calculate new version
+          case "$VERSION_TYPE" in
+            major)
+              NEW_VERSION="$((MAJOR + 1)).0.0"
+              ;;
+            minor)
+              NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
+              ;;
+            patch)
+              NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+              ;;
+            *)
+              echo "Invalid version type: $VERSION_TYPE"
+              exit 1
+              ;;
+          esac
+
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION"
+
+          echo "## Version Calculation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Current | $CURRENT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | $VERSION_TYPE |" >> $GITHUB_STEP_SUMMARY
+          echo "| New | $NEW_VERSION |" >> $GITHUB_STEP_SUMMARY
+
+  publish-to-pmr:
+    name: 'Publish to PMR'
+    needs: [check-merge, calculate-version]
+    if: needs.check-merge.outputs.should_release == 'true' && inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate PMR Configuration
+        run: |
+          if [ -z "${{ vars.TFE_ORG }}" ]; then
+            echo "❌ TFE_ORG variable is not set"
+            exit 1
+          fi
+          if [ -z "${{ vars.TFE_MODULE }}" ]; then
+            echo "❌ TFE_MODULE variable is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.TFE_TOKEN }}" ]; then
+            echo "❌ TFE_TOKEN secret is not set"
+            exit 1
+          fi
+          echo "✅ PMR configuration validated"
+
+      - name: Publish Module Version
+        id: publish
+        run: |
+          PROVIDER="${{ vars.TFE_PROVIDER || 'aws' }}"
+          VERSION="${{ needs.calculate-version.outputs.new_version }}"
+          COMMIT_SHA="${{ github.sha }}"
+
+          echo "Publishing version $VERSION to PMR..."
+          echo "Commit SHA: $COMMIT_SHA"
+
+          # Create version via API
+          API_URL="https://${{ env.TFE_HOSTNAME }}/api/v2/organizations/${{ vars.TFE_ORG }}/registry-modules/private/${{ vars.TFE_ORG }}/${{ vars.TFE_MODULE }}/$PROVIDER/versions"
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "data": {
+              "type": "registry-module-versions",
+              "attributes": {
+                "version": "$VERSION",
+                "commit-sha": "$COMMIT_SHA"
+              }
+            }
+          }
+          EOF
+          )
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.TFE_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            -d "$PAYLOAD" \
+            "$API_URL")
+
+          echo "API Response:"
+          echo "$RESPONSE" | jq .
+
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "❌ Failed to publish module version"
+            echo "$RESPONSE" | jq '.errors'
+            exit 1
+          fi
+
+          echo "✅ Successfully published version $VERSION"
+          echo "published=true" >> $GITHUB_OUTPUT
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+
+      - name: Create Git Tag
+        run: |
+          VERSION="${{ needs.calculate-version.outputs.new_version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+          echo "✅ Created and pushed tag v$VERSION"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.calculate-version.outputs.new_version }}
+          name: Release ${{ needs.calculate-version.outputs.new_version }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publication Summary
+        run: |
+          VERSION="${{ needs.calculate-version.outputs.new_version }}"
+          PROVIDER="${{ vars.TFE_PROVIDER || 'aws' }}"
+
+          echo "## 🎉 Module Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | $VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Organization | ${{ vars.TFE_ORG }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Module | ${{ vars.TFE_MODULE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Provider | $PROVIDER |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Module Source" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```hcl' >> $GITHUB_STEP_SUMMARY
+          echo 'module "example" {' >> $GITHUB_STEP_SUMMARY
+          echo '  source  = "app.terraform.io/${{ vars.TFE_ORG }}/${{ vars.TFE_MODULE }}/'$PROVIDER'"' >> $GITHUB_STEP_SUMMARY
+          echo '  version = "'$VERSION'"' >> $GITHUB_STEP_SUMMARY
+          echo '}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Branch-Based PMR Notes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Version published with commit SHA: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "PMR will now run any configured tests for this module version." >> $GITHUB_STEP_SUMMARY
+
+  dry-run-summary:
+    name: 'Dry Run Summary'
+    needs: [check-merge, calculate-version]
+    if: needs.check-merge.outputs.should_release == 'true' && inputs.dry_run == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dry Run Results
+        run: |
+          echo "## 🧪 Dry Run Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Would have published:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Current Version | ${{ needs.calculate-version.outputs.current_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| New Version | ${{ needs.calculate-version.outputs.new_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version Type | ${{ needs.check-merge.outputs.version_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**No changes were made.** Re-run without dry_run to publish." >> $GITHUB_STEP_SUMMARY
