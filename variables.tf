@@ -11,7 +11,7 @@ variable "bucket_name" {
   default     = null
 
   validation {
-    condition     = var.bucket_name == null || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.bucket_name))
+    condition     = var.bucket_name == null ? true : can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.bucket_name))
     error_message = "Bucket name must be 3-63 characters, lowercase letters, numbers, hyphens, and periods only. Must start and end with a letter or number."
   }
 }
@@ -22,7 +22,7 @@ variable "bucket_prefix" {
   default     = null
 
   validation {
-    condition     = var.bucket_prefix == null || (length(var.bucket_prefix) <= 37 && can(regex("^[a-z0-9][a-z0-9.-]*$", var.bucket_prefix)))
+    condition     = var.bucket_prefix == null ? true : (length(var.bucket_prefix) <= 37 && can(regex("^[a-z0-9][a-z0-9.-]*$", var.bucket_prefix)))
     error_message = "Bucket prefix must be max 37 characters, lowercase letters, numbers, hyphens, and periods only. Must start with a letter or number."
   }
 }
