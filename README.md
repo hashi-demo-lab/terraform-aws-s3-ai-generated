@@ -2,6 +2,8 @@
 
 A production-ready Terraform module for provisioning secure AWS S3 buckets with security-first defaults.
 
+<!-- Test change for workflow validation -->
+
 ## Features
 
 - **Encryption at Rest**: SSE-KMS encryption with module-managed or bring-your-own KMS key
