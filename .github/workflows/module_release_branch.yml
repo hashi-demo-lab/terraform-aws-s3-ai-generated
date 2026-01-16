@@ -1,15 +1,15 @@
 # Branch-Based Module Release Workflow
 # Publishes to Terraform Private Module Registry from branch merges
 #
-# USE CASE: Branch-based PMR sources
+# USE CASE: VCS-connected branch-based PMR sources
 # - Triggered when PRs merge to main
 # - Calculates next semantic version from PR labels
-# - Manually publishes to PMR with specific commit SHA
+# - Creates VCS-connected module in PMR (if not exists)
+# - Creates version which triggers PMR to pull from GitHub
 # - PMR CAN run tests after publication
 #
 # KEY DIFFERENCES FROM TAG-BASED:
-# - Must manually publish version to PMR (even after merge to main)
-# - Must specify commit SHA when publishing
+# - Uses branch-based publishing (PMR pulls from main branch)
 # - PMR can run integration tests after publication
 # - Version calculated from semver:* labels on PR
 #
@@ -17,8 +17,9 @@
 # 1. PR is created with semver:patch, semver:minor, or semver:major label
 # 2. PR is merged to main
 # 3. This workflow calculates the next version
-# 4. Publishes to PMR via API with commit SHA
-# 5. PMR runs configured tests (if enabled)
+# 4. Creates VCS-connected module (if first time)
+# 5. Creates version - PMR pulls code directly from GitHub
+# 6. PMR runs configured tests (if enabled)
 #
 # REQUIRED SECRETS:
 # - TFE_TOKEN: Terraform Cloud/Enterprise API token
@@ -27,6 +28,7 @@
 # - TFE_ORG: Terraform Cloud organization name
 # - TFE_MODULE: Module name (without provider suffix)
 # - TFE_PROVIDER: Provider name (aws, azurerm, google, etc.)
+# - TFE_OAUTH_TOKEN_ID: OAuth token ID for VCS connection
 
 name: 'Module Release (Branch-Based)'
 
@@ -209,6 +211,11 @@ jobs:
             echo "❌ TFE_MODULE variable is not set"
             exit 1
           fi
+          if [ -z "${{ vars.TFE_OAUTH_TOKEN_ID }}" ]; then
+            echo "❌ TFE_OAUTH_TOKEN_ID variable is not set"
+            echo "Get this from HCP Terraform: Settings → VCS Providers → OAuth Token ID"
+            exit 1
+          fi
           if [ -z "${{ secrets.TFE_TOKEN }}" ]; then
             echo "❌ TFE_TOKEN secret is not set"
             exit 1
@@ -220,13 +227,14 @@ jobs:
         run: |
           PROVIDER="${{ vars.TFE_PROVIDER || 'aws' }}"
           VERSION="${{ needs.calculate-version.outputs.new_version }}"
-          COMMIT_SHA="${{ github.sha }}"
           ORG="${{ vars.TFE_ORG }}"
           MODULE="${{ vars.TFE_MODULE }}"
           HOSTNAME="${{ env.TFE_HOSTNAME }}"
+          OAUTH_TOKEN_ID="${{ vars.TFE_OAUTH_TOKEN_ID }}"
+          REPO="${{ github.repository }}"
 
           echo "Publishing version $VERSION to PMR..."
-          echo "Commit SHA: $COMMIT_SHA"
+          echo "Repository: $REPO"
 
           # First, check if the module exists
           MODULE_URL="https://$HOSTNAME/api/v2/organizations/$ORG/registry-modules/private/$ORG/$MODULE/$PROVIDER"
@@ -243,26 +251,32 @@ jobs:
           echo "Module check HTTP status: $HTTP_CODE"
           
           if [ "$HTTP_CODE" = "404" ]; then
-            echo "Module does not exist. Creating module first..."
+            echo "Module does not exist. Creating VCS-connected module..."
             
-            # Create the module (without VCS connection)
-            CREATE_MODULE_URL="https://$HOSTNAME/api/v2/organizations/$ORG/registry-modules"
+            # Create the module with VCS connection (branch-based)
+            CREATE_MODULE_URL="https://$HOSTNAME/api/v2/organizations/$ORG/registry-modules/vcs"
             
             CREATE_PAYLOAD=$(cat <<EOF
           {
             "data": {
               "type": "registry-modules",
               "attributes": {
-                "name": "$MODULE",
-                "provider": "$PROVIDER",
-                "registry-name": "private"
+                "vcs-repo": {
+                  "identifier": "$REPO",
+                  "oauth-token-id": "$OAUTH_TOKEN_ID",
+                  "display_identifier": "$REPO",
+                  "branch": "main"
+                }
               }
             }
           }
           EOF
           )
             
-            echo "Creating module at: $CREATE_MODULE_URL"
+            echo "Creating VCS-connected module at: $CREATE_MODULE_URL"
+            echo "Payload:"
+            echo "$CREATE_PAYLOAD" | jq .
+            
             CREATE_RESPONSE=$(curl -s -X POST \
               -H "Authorization: Bearer ${{ secrets.TFE_TOKEN }}" \
               -H "Content-Type: application/vnd.api+json" \
@@ -278,12 +292,13 @@ jobs:
               exit 1
             fi
             
-            echo "✅ Module created successfully"
+            echo "✅ VCS-connected module created successfully"
+            echo "HCP Terraform will now pull code directly from GitHub"
           else
             echo "✅ Module already exists"
           fi
 
-          # Now create the version
+          # Now create the version - HCP Terraform will pull from GitHub
           VERSION_URL="https://$HOSTNAME/api/v2/organizations/$ORG/registry-modules/private/$ORG/$MODULE/$PROVIDER/versions"
 
           VERSION_PAYLOAD=$(cat <<EOF
@@ -298,7 +313,7 @@ jobs:
           EOF
           )
 
-          echo "Creating version at: $VERSION_URL"
+          echo "Creating version $VERSION at: $VERSION_URL"
           VERSION_RESPONSE=$(curl -s -X POST \
             -H "Authorization: Bearer ${{ secrets.TFE_TOKEN }}" \
             -H "Content-Type: application/vnd.api+json" \
@@ -315,43 +330,8 @@ jobs:
             exit 1
           fi
 
-          # Get the upload URL
-          UPLOAD_URL=$(echo "$VERSION_RESPONSE" | jq -r '.data.links.upload // empty')
-          
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "❌ No upload URL returned"
-            exit 1
-          fi
-
-          echo "Upload URL: $UPLOAD_URL"
-
-          # Create the module archive
-          echo "Creating module archive..."
-          tar -czvf module.tar.gz \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.terraform' \
-            --exclude='*.tfstate*' \
-            --exclude='module.tar.gz' \
-            .
-
-          # Upload the module archive
-          echo "Uploading module archive..."
-          UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @module.tar.gz \
-            "$UPLOAD_URL")
-
-          UPLOAD_HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -n1)
-          echo "Upload HTTP status: $UPLOAD_HTTP_CODE"
-
-          if [ "$UPLOAD_HTTP_CODE" != "200" ] && [ "$UPLOAD_HTTP_CODE" != "201" ]; then
-            echo "❌ Failed to upload module archive"
-            echo "$UPLOAD_RESPONSE" | sed '$d'
-            exit 1
-          fi
-
-          echo "✅ Successfully published version $VERSION"
+          echo "✅ Successfully created version $VERSION"
+          echo "HCP Terraform is now pulling the code from GitHub..."
           echo "published=true" >> $GITHUB_OUTPUT
 
       - name: Create Git Tag
@@ -396,9 +376,12 @@ jobs:
           echo '}' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Branch-Based PMR Notes" >> $GITHUB_STEP_SUMMARY
+          echo "### VCS-Connected Module" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Version published with commit SHA: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "✅ HCP Terraform pulled code directly from GitHub" >> $GITHUB_STEP_SUMMARY
+          echo "- Repository: \`${{ github.repository }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch: \`main\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "PMR will now run any configured tests for this module version." >> $GITHUB_STEP_SUMMARY
 
