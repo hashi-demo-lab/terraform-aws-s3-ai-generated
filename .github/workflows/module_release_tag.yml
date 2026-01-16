@@ -25,7 +25,7 @@
 
 name: 'Module Release (Tag-Based)'
 
-run-name: 'Release: ${{ github.ref_name }}'
+run-name: 'Release: ${{ inputs.tag || github.ref_name }}'
 
 on:
   push:
@@ -34,6 +34,10 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+-*'  # Pre-release tags like v1.0.0-beta.1
   workflow_dispatch:
     inputs:
+      tag:
+        description: 'Tag to release (e.g., v1.0.0)'
+        required: true
+        type: string
       skip_tests:
         description: 'Skip integration tests'
         required: false
@@ -58,16 +62,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
       is_prerelease: ${{ steps.version.outputs.is_prerelease }}
 
     steps:
       - name: Extract Version from Tag
         id: version
         run: |
-          TAG="${{ github.ref_name }}"
+          # Use input tag if provided (workflow_dispatch), otherwise use ref_name (push event)
+          TAG="${{ inputs.tag || github.ref_name }}"
           # Remove 'v' prefix if present
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
           # Check if pre-release
           if [[ "$VERSION" == *"-"* ]]; then
@@ -100,6 +107,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-tag.outputs.tag }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -143,6 +152,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.validate-tag.outputs.tag }}
           fetch-depth: 0
 
       - name: Generate Changelog
@@ -150,7 +160,7 @@ jobs:
         run: |
           # Get the previous tag
           PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          CURRENT_TAG="${{ github.ref_name }}"
+          CURRENT_TAG="${{ needs.validate-tag.outputs.tag }}"
 
           echo "## Changelog" > changelog.md
           echo "" >> changelog.md
@@ -176,7 +186,7 @@ jobs:
         if: ${{ inputs.dry_run != 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.validate-tag.outputs.tag }}
           name: Release ${{ needs.validate-tag.outputs.version }}
           body_path: changelog.md
           prerelease: ${{ needs.validate-tag.outputs.is_prerelease == 'true' }}
@@ -201,7 +211,7 @@ jobs:
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Version | ${{ needs.validate-tag.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Tag | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ needs.validate-tag.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Pre-release | ${{ needs.validate-tag.outputs.is_prerelease }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### PMR Auto-Publish" >> $GITHUB_STEP_SUMMARY

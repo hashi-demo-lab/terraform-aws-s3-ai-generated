@@ -221,46 +221,138 @@ jobs:
           PROVIDER="${{ vars.TFE_PROVIDER || 'aws' }}"
           VERSION="${{ needs.calculate-version.outputs.new_version }}"
           COMMIT_SHA="${{ github.sha }}"
+          ORG="${{ vars.TFE_ORG }}"
+          MODULE="${{ vars.TFE_MODULE }}"
+          HOSTNAME="${{ env.TFE_HOSTNAME }}"
 
           echo "Publishing version $VERSION to PMR..."
           echo "Commit SHA: $COMMIT_SHA"
 
-          # Create version via API
-          API_URL="https://${{ env.TFE_HOSTNAME }}/api/v2/organizations/${{ vars.TFE_ORG }}/registry-modules/private/${{ vars.TFE_ORG }}/${{ vars.TFE_MODULE }}/$PROVIDER/versions"
+          # First, check if the module exists
+          MODULE_URL="https://$HOSTNAME/api/v2/organizations/$ORG/registry-modules/private/$ORG/$MODULE/$PROVIDER"
+          
+          echo "Checking if module exists at: $MODULE_URL"
+          MODULE_CHECK=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.TFE_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            "$MODULE_URL")
+          
+          HTTP_CODE=$(echo "$MODULE_CHECK" | tail -n1)
+          MODULE_BODY=$(echo "$MODULE_CHECK" | sed '$d')
+          
+          echo "Module check HTTP status: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" = "404" ]; then
+            echo "Module does not exist. Creating module first..."
+            
+            # Create the module (without VCS connection)
+            CREATE_MODULE_URL="https://$HOSTNAME/api/v2/organizations/$ORG/registry-modules"
+            
+            CREATE_PAYLOAD=$(cat <<EOF
+          {
+            "data": {
+              "type": "registry-modules",
+              "attributes": {
+                "name": "$MODULE",
+                "provider": "$PROVIDER",
+                "registry-name": "private"
+              }
+            }
+          }
+          EOF
+          )
+            
+            echo "Creating module at: $CREATE_MODULE_URL"
+            CREATE_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.TFE_TOKEN }}" \
+              -H "Content-Type: application/vnd.api+json" \
+              -d "$CREATE_PAYLOAD" \
+              "$CREATE_MODULE_URL")
+            
+            echo "Create module response:"
+            echo "$CREATE_RESPONSE" | jq .
+            
+            if echo "$CREATE_RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then
+              echo "❌ Failed to create module"
+              echo "$CREATE_RESPONSE" | jq '.errors'
+              exit 1
+            fi
+            
+            echo "✅ Module created successfully"
+          else
+            echo "✅ Module already exists"
+          fi
 
-          PAYLOAD=$(cat <<EOF
+          # Now create the version
+          VERSION_URL="https://$HOSTNAME/api/v2/organizations/$ORG/registry-modules/private/$ORG/$MODULE/$PROVIDER/versions"
+
+          VERSION_PAYLOAD=$(cat <<EOF
           {
             "data": {
               "type": "registry-module-versions",
               "attributes": {
-                "version": "$VERSION",
-                "commit-sha": "$COMMIT_SHA"
+                "version": "$VERSION"
               }
             }
           }
           EOF
           )
 
-          RESPONSE=$(curl -s -X POST \
+          echo "Creating version at: $VERSION_URL"
+          VERSION_RESPONSE=$(curl -s -X POST \
             -H "Authorization: Bearer ${{ secrets.TFE_TOKEN }}" \
             -H "Content-Type: application/vnd.api+json" \
-            -d "$PAYLOAD" \
-            "$API_URL")
+            -d "$VERSION_PAYLOAD" \
+            "$VERSION_URL")
 
-          echo "API Response:"
-          echo "$RESPONSE" | jq .
+          echo "Version creation response:"
+          echo "$VERSION_RESPONSE" | jq .
 
           # Check for errors
-          if echo "$RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then
-            echo "❌ Failed to publish module version"
-            echo "$RESPONSE" | jq '.errors'
+          if echo "$VERSION_RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "❌ Failed to create module version"
+            echo "$VERSION_RESPONSE" | jq '.errors'
+            exit 1
+          fi
+
+          # Get the upload URL
+          UPLOAD_URL=$(echo "$VERSION_RESPONSE" | jq -r '.data.links.upload // empty')
+          
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "❌ No upload URL returned"
+            exit 1
+          fi
+
+          echo "Upload URL: $UPLOAD_URL"
+
+          # Create the module archive
+          echo "Creating module archive..."
+          tar -czvf module.tar.gz \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.terraform' \
+            --exclude='*.tfstate*' \
+            --exclude='module.tar.gz' \
+            .
+
+          # Upload the module archive
+          echo "Uploading module archive..."
+          UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @module.tar.gz \
+            "$UPLOAD_URL")
+
+          UPLOAD_HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -n1)
+          echo "Upload HTTP status: $UPLOAD_HTTP_CODE"
+
+          if [ "$UPLOAD_HTTP_CODE" != "200" ] && [ "$UPLOAD_HTTP_CODE" != "201" ]; then
+            echo "❌ Failed to upload module archive"
+            echo "$UPLOAD_RESPONSE" | sed '$d'
             exit 1
           fi
 
           echo "✅ Successfully published version $VERSION"
           echo "published=true" >> $GITHUB_OUTPUT
-        env:
-          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
 
       - name: Create Git Tag
         run: |
