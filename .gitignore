@@ -1,0 +1,27 @@
+# Terraform directories and files
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Note: .terraform.lock.hcl is intentionally NOT ignored
+# Lock files should be committed for reproducible builds
+
+# IDE
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local testing
+*.auto.tfvars
