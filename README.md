@@ -265,6 +265,54 @@ restrict_public_buckets = false
 ```
 
 <!-- BEGIN_TF_DOCS -->
+# terraform-aws-s3-module
+
+## Usage
+
+### Basic Usage - Secure Bucket (Default)
+
+```hcl
+module "s3_bucket" {
+  source  = "app.terraform.io/hashi-demos-apj/s3/aws"
+  version = "~> 1.0"
+
+  bucket_name      = "my-secure-bucket-12345"
+  application_name = "my-application"
+  environment      = "dev"
+}
+```
+
+### KMS Encryption
+
+```hcl
+module "s3_bucket" {
+  source  = "app.terraform.io/hashi-demos-apj/s3/aws"
+  version = "~> 1.0"
+
+  bucket_name             = "my-kms-encrypted-bucket"
+  application_name        = "my-application"
+  environment             = "prod"
+  encryption_type         = "KMS"
+  enable_kms_key_rotation = true
+}
+```
+
+### Static Website Hosting
+
+```hcl
+module "website_bucket" {
+  source  = "app.terraform.io/hashi-demos-apj/s3/aws"
+  version = "~> 1.0"
+
+  bucket_name            = "my-website-bucket"
+  application_name       = "my-website"
+  environment            = "prod"
+  enable_website         = true
+  website_index_document = "index.html"
+  website_error_document = "error.html"
+}
+```
+
 ## Requirements
 
 | Name | Version |
@@ -306,12 +354,12 @@ No modules.
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
+| <a name="input_bucket_name"></a> [bucket\_name](#input\_bucket\_name) | Unique name for the S3 bucket. Must be globally unique across all AWS accounts. | `string` | n/a | yes |
+| <a name="input_environment"></a> [environment](#input\_environment) | Deployment environment identifier (e.g., dev, staging, prod). Used for tagging. | `string` | n/a | yes |
 | <a name="input_block_public_acls"></a> [block\_public\_acls](#input\_block\_public\_acls) | Block public ACL creation on the bucket. Set to false only for static website hosting. | `bool` | `true` | no |
 | <a name="input_block_public_policy"></a> [block\_public\_policy](#input\_block\_public\_policy) | Block public bucket policy attachment. Set to false only for static website hosting. | `bool` | `true` | no |
-| <a name="input_bucket_name"></a> [bucket\_name](#input\_bucket\_name) | Unique name for the S3 bucket. Must be globally unique across all AWS accounts. | `string` | n/a | yes |
 | <a name="input_enable_logging"></a> [enable\_logging](#input\_enable\_logging) | Enable server access logging. Requires logging\_bucket to be specified when true. | `bool` | `false` | no |
 | <a name="input_enable_versioning"></a> [enable\_versioning](#input\_enable\_versioning) | Enable bucket versioning for object version management and data protection. WARNING: Once enabled, versioning can only be suspended, not disabled. Suspending versioning does not delete existing versions. | `bool` | `true` | no |
-| <a name="input_environment"></a> [environment](#input\_environment) | Deployment environment identifier (e.g., dev, staging, prod). Used for tagging. | `string` | n/a | yes |
 | <a name="input_ignore_public_acls"></a> [ignore\_public\_acls](#input\_ignore\_public\_acls) | Ignore existing public ACLs on the bucket. Set to false only for static website hosting. | `bool` | `true` | no |
 | <a name="input_kms_deletion_window_in_days"></a> [kms\_deletion\_window\_in\_days](#input\_kms\_deletion\_window\_in\_days) | Waiting period in days before KMS key deletion. Only applies when module creates the KMS key. Minimum 7 days, maximum 30 days. | `number` | `30` | no |
 | <a name="input_kms_key_arn"></a> [kms\_key\_arn](#input\_kms\_key\_arn) | ARN of an existing KMS key for bucket encryption. If not provided, the module creates a new KMS key. | `string` | `null` | no |
@@ -334,6 +382,7 @@ No modules.
 | <a name="output_kms_key_id"></a> [kms\_key\_id](#output\_kms\_key\_id) | ID of the KMS key used for bucket encryption |
 | <a name="output_website_domain"></a> [website\_domain](#output\_website\_domain) | Website domain for DNS configuration (only when website hosting is enabled) |
 | <a name="output_website_endpoint"></a> [website\_endpoint](#output\_website\_endpoint) | Website endpoint URL (only when website hosting is enabled) |
+
 <!-- END_TF_DOCS -->
 
 ## Examples
